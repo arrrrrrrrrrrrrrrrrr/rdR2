@@ -1,3 +1,6 @@
 fuzzywuzzy
 requests
 python-Levenshtein
+sqlite3
+bencodepy
+hashlib
