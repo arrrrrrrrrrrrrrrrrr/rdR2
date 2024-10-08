@@ -8,8 +8,8 @@ from fuzzywuzzy import fuzz
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-# Global flag to control the background logger thread
-listing_in_progress = False
+# Global flags for progress reporting
+parsing_in_progress = False
 
 # Log function
 def log(message, torrent_name=None, is_error=False):
@@ -47,23 +47,68 @@ def load_settings():
         log(f"Error decoding JSON from settings.json: {str(e)}", is_error=True)
         raise
 
-# Periodically log the number of files listed so far
-def periodic_log(file_list):
-    while listing_in_progress:
-        log(f"Files listed so far: {len(file_list)}")
-        time.sleep(10)  # Log every 10 seconds
+# Periodically log the number of files parsed so far
+def periodic_parse_log(parsed_files):
+    while parsing_in_progress:
+        log(f"Files parsed so far: {len(parsed_files)}")
+        time.sleep(30)  # Log every 30 seconds
+
+# Parse .zurginfo and .zurgtorrent files recursively from subdirectories with progress logs
+def parse_torrent_files_recursively(zurginfo_dir):
+    log(f"Recursively parsing .zurginfo and .zurgtorrent files from directory: {zurginfo_dir}")
+    torrents = []
+    parsed_files = []
+
+    global parsing_in_progress
+    parsing_in_progress = True
+
+    # Start background thread for periodic progress logging
+    logger_thread = threading.Thread(target=periodic_parse_log, args=(parsed_files,))
+    logger_thread.start()
+
+    try:
+        for root, dirs, files in os.walk(zurginfo_dir):  # Recursively walk through subdirectories
+            for file_name in files:
+                if file_name.endswith('.zurginfo') or file_name.endswith('.zurgtorrent'):
+                    file_path = os.path.join(root, file_name)
+                    try:
+                        with open(file_path, 'r') as file:
+                            data = json.load(file)
+
+                            # Handling .zurginfo and .zurgtorrent files differently based on keys
+                            if file_name.endswith('.zurginfo'):
+                                torrents.append({
+                                    'hash': data.get('hash'),
+                                    'status': 0,
+                                    'torname': data.get('filename')
+                                })
+                            elif file_name.endswith('.zurgtorrent'):
+                                torrents.append({
+                                    'hash': data.get('Hash'),
+                                    'status': 0,
+                                    'torname': data.get('Name')
+                                })
+
+                            # Log the current file being parsed
+                            log(f"Parsed file: {file_name}")
+
+                            # Add the file name to the parsed_files list
+                            parsed_files.append(file_name)
+
+                    except json.JSONDecodeError as e:
+                        log(f"Error decoding JSON in file: {file_name}. Error: {str(e)}", is_error=True)
+
+    finally:
+        parsing_in_progress = False
+        logger_thread.join()  # Ensure the logging thread ends before continuing
+
+    log(f"Parsed {len(torrents)} torrents from .zurginfo and .zurgtorrent files.")
+    return torrents
 
 # List files with rclone recursively and show progress
 def list_rclone_files(remote_path):
     log(f"Listing files with rclone from: {remote_path}")
     file_list = []
-
-    global listing_in_progress
-    listing_in_progress = True
-
-    # Start the background thread for periodic logging
-    logger_thread = threading.Thread(target=periodic_log, args=(file_list,))
-    logger_thread.start()
 
     try:
         # Use subprocess to run the rclone command and let it finish naturally
@@ -89,39 +134,7 @@ def list_rclone_files(remote_path):
     except Exception as e:
         log(f"Error executing rclone command: {str(e)}", is_error=True)
 
-    finally:
-        listing_in_progress = False
-        logger_thread.join()  # Ensure the logging thread ends before continuing
-
     return file_list
-
-# Parse .zurginfo and .zurgtorrent files recursively from subdirectories
-def parse_torrent_files_recursively(zurginfo_dir):
-    log(f"Recursively parsing .zurginfo and .zurgtorrent files from directory: {zurginfo_dir}")
-    torrents = []
-
-    for root, dirs, files in os.walk(zurginfo_dir):  # Recursively walk through subdirectories
-        for file_name in files:
-            if file_name.endswith('.zurginfo') or file_name.endswith('.zurgtorrent'):
-                file_path = os.path.join(root, file_name)
-                with open(file_path, 'r') as file:
-                    data = json.load(file)
-
-                    # Handling .zurginfo and .zurgtorrent files differently based on keys
-                    if file_name.endswith('.zurginfo'):
-                        torrents.append({
-                            'hash': data.get('hash'),
-                            'status': 0,
-                            'torname': data.get('filename')
-                        })
-                    elif file_name.endswith('.zurgtorrent'):
-                        torrents.append({
-                            'hash': data.get('Hash'),
-                            'status': 0,
-                            'torname': data.get('Name')
-                        })
-    log(f"Parsed {len(torrents)} torrents from .zurginfo and .zurgtorrent files.")
-    return torrents
 
 # Fuzzy matching with parallel processing
 def match_in_parallel(file_list, torrent_name, match_threshold=85):
@@ -158,11 +171,11 @@ def add_torrent_to_rd(api_key, magnet_hash, torrent_name, timeout):
 def process_torrents(api_key, mounted_path, zurginfo_dir, timeout, match_threshold, api_delay):
     log("Starting torrent processing workflow.")
 
-    # Step 1: List all files/folders using rclone recursively
-    file_list = list_rclone_files(mounted_path)
-
-    # Step 2: Parse all .zurginfo and .zurgtorrent files recursively
+    # Step 1: Parse all .zurginfo and .zurgtorrent files recursively
     torrents = parse_torrent_files_recursively(zurginfo_dir)
+
+    # Step 2: List all files/folders using rclone recursively
+    file_list = list_rclone_files(mounted_path)
 
     # Step 3: Match each torrent against the files/folders
     for torrent in torrents:
