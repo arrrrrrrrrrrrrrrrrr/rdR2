@@ -3,7 +3,8 @@ import subprocess
 import time
 import json
 import threading
-import requests  # Import requests library
+import requests
+import sqlite3  # For SQLite database
 from fuzzywuzzy import fuzz
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -30,7 +31,7 @@ def load_settings():
         with open('settings.json', 'r') as config_file:
             settings = json.load(config_file)
 
-        required_keys = ['REAL_DEBRID_API_KEY', 'MOUNTED_PATH', 'ZURGINFOS_DIR']
+        required_keys = ['REAL_DEBRID_API_KEY', 'MOUNTED_PATH', 'ZURGINFOS_DIR', 'DB_FILE']
         for key in required_keys:
             if key not in settings:
                 raise KeyError(f"Missing required setting: {key}")
@@ -47,16 +48,55 @@ def load_settings():
         log(f"Error decoding JSON from settings.json: {str(e)}", is_error=True)
         raise
 
+# Initialize the SQLite database and create a table for torrents
+def initialize_database(db_file):
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    
+    # Create table if not exists
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS torrents (
+            hash TEXT PRIMARY KEY,
+            torname TEXT,
+            status INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    return conn
+
+# Insert or update torrent data into the database
+def insert_or_update_torrent(conn, torrent):
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO torrents (hash, torname, status)
+        VALUES (?, ?, ?)
+        ON CONFLICT(hash) DO UPDATE SET
+            torname=excluded.torname,
+            status=excluded.status
+    ''', (torrent['hash'], torrent['torname'], torrent['status']))
+    conn.commit()
+
+# Update the status of a torrent in the database
+def update_torrent_status(conn, torrent_hash, status):
+    cursor = conn.cursor()
+    cursor.execute('UPDATE torrents SET status = ? WHERE hash = ?', (status, torrent_hash))
+    conn.commit()
+
+# Query all torrents from the database
+def fetch_all_torrents(conn):
+    cursor = conn.cursor()
+    cursor.execute('SELECT hash, torname, status FROM torrents')
+    return cursor.fetchall()
+
 # Periodically log the number of files parsed so far
 def periodic_parse_log(parsed_files):
     while parsing_in_progress:
         log(f"Files parsed so far: {len(parsed_files)}")
         time.sleep(30)  # Log every 30 seconds
 
-# Parse .zurginfo and .zurgtorrent files recursively from subdirectories with progress logs
-def parse_torrent_files_recursively(zurginfo_dir):
+# Parse .zurginfo and .zurgtorrent files recursively and insert into the database
+def parse_torrent_files_recursively(zurginfo_dir, conn):
     log(f"Recursively parsing .zurginfo and .zurgtorrent files from directory: {zurginfo_dir}")
-    torrents = []
     parsed_files = []
 
     global parsing_in_progress
@@ -75,22 +115,25 @@ def parse_torrent_files_recursively(zurginfo_dir):
                         with open(file_path, 'r') as file:
                             data = json.load(file)
 
-                            # Handling .zurginfo and .zurgtorrent files differently based on keys
+                            torrent = {}
                             if file_name.endswith('.zurginfo'):
-                                torrents.append({
+                                torrent = {
                                     'hash': data.get('hash'),
                                     'status': 0,
                                     'torname': data.get('filename')
-                                })
+                                }
                             elif file_name.endswith('.zurgtorrent'):
-                                torrents.append({
+                                torrent = {
                                     'hash': data.get('Hash'),
                                     'status': 0,
                                     'torname': data.get('Name')
-                                })
+                                }
+
+                            # Insert or update the torrent in the database
+                            insert_or_update_torrent(conn, torrent)
 
                             # Log the current file being parsed
-                            log(f"Parsed file: {file_name}")
+                            log(f"Parsed and added to DB: {file_name}")
 
                             # Add the file name to the parsed_files list
                             parsed_files.append(file_name)
@@ -102,8 +145,7 @@ def parse_torrent_files_recursively(zurginfo_dir):
         parsing_in_progress = False
         logger_thread.join()  # Ensure the logging thread ends before continuing
 
-    log(f"Parsed {len(torrents)} torrents from .zurginfo and .zurgtorrent files.")
-    return torrents
+    log(f"Finished parsing torrents. Total parsed: {len(parsed_files)}")
 
 # List files with rclone recursively and show progress
 def list_rclone_files(remote_path):
@@ -168,36 +210,45 @@ def add_torrent_to_rd(api_key, magnet_hash, torrent_name, timeout):
         return None
 
 # Main torrent processing function
-def process_torrents(api_key, mounted_path, zurginfo_dir, timeout, match_threshold, api_delay):
+def process_torrents(api_key, mounted_path, zurginfo_dir, db_file, timeout, match_threshold, api_delay):
     log("Starting torrent processing workflow.")
 
-    # Step 1: Parse all .zurginfo and .zurgtorrent files recursively
-    torrents = parse_torrent_files_recursively(zurginfo_dir)
+    # Step 1: Initialize the database
+    conn = initialize_database(db_file)
 
-    # Step 2: List all files/folders using rclone recursively
+    # Step 2: Parse all .zurginfo and .zurgtorrent files recursively and store in the DB
+    parse_torrent_files_recursively(zurginfo_dir, conn)
+
+    # Step 3: List all files/folders using rclone recursively
     file_list = list_rclone_files(mounted_path)
 
-    # Step 3: Match each torrent against the files/folders
-    for torrent in torrents:
-        torrent_name = torrent['torname']
-        magnet_hash = torrent['hash']
+    # Step 4: Match each torrent in the database against the files/folders
+    torrents = fetch_all_torrents(conn)
+    for torrent_hash, torrent_name, status in torrents:
+        if status == 1:  # Skip already processed torrents
+            continue
 
         # Match in parallel
         if match_in_parallel(file_list, torrent_name, match_threshold):
             log(f"Torrent '{torrent_name}' already exists in mounted path. Skipping.")
+            update_torrent_status(conn, torrent_hash, 1)  # Mark as processed
             continue
 
         # Add to Real-Debrid if no match found
         log(f"No match found for '{torrent_name}'. Adding to Real-Debrid.")
-        torrent_id = add_torrent_to_rd(api_key, magnet_hash, torrent_name, timeout)
+        torrent_id = add_torrent_to_rd(api_key, torrent_hash, torrent_name, timeout)
 
         if torrent_id:
             log(f"Successfully added and processed torrent '{torrent_name}'.")
+            update_torrent_status(conn, torrent_hash, 1)  # Mark as processed
         else:
             log(f"Failed to process torrent '{torrent_name}'.", is_error=True)
 
         log(f"Waiting for {api_delay} seconds before the next Real-Debrid API call.")
         time.sleep(api_delay)
+
+    # Close the database connection
+    conn.close()
 
 if __name__ == '__main__':
     try:
@@ -206,12 +257,13 @@ if __name__ == '__main__':
         api_key = settings.get('REAL_DEBRID_API_KEY')
         mounted_path = settings.get('MOUNTED_PATH')
         zurginfo_dir = settings.get('ZURGINFOS_DIR')
+        db_file = settings.get('DB_FILE')
         execution_cycle = settings.get('EXECUTION_CYCLE', 86400)  # Default to 24 hours
         timeout = settings.get('REAL_DEBRID_TIMEOUT', 30)  # Default to 30 seconds
         match_threshold = settings.get('MATCH_THRESHOLD', 85)  # Default fuzzy match threshold
         api_delay = settings.get('REAL_DEBRID_API_DELAY', 10)  # Delay between API calls
 
-        process_torrents(api_key, mounted_path, zurginfo_dir, timeout, match_threshold, api_delay)
+        process_torrents(api_key, mounted_path, zurginfo_dir, db_file, timeout, match_threshold, api_delay)
 
     except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
         log(f"Critical error occurred: {str(e)}", is_error=True)
