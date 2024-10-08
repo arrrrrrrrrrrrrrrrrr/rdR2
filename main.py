@@ -4,17 +4,19 @@ import time
 import json
 import threading
 import requests
-import sqlite3  # For SQLite database
+import sqlite3
 from fuzzywuzzy import fuzz
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import bencodepy
+import hashlib
 
 # Global flags for progress reporting
 parsing_in_progress = False
 
 # Log function
 def log(message, torrent_name=None, is_error=False):
-    timestamp = datetime.now().strftime("%Y-%m-%D %H:%M:%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if torrent_name:
         message = f"[{torrent_name}] {message}"
     if is_error:
@@ -28,31 +30,35 @@ def log(message, torrent_name=None, is_error=False):
 # Load settings from the JSON config file
 def load_settings():
     try:
-        with open('settings.json', 'r') as config_file:
-            settings = json.load(config_file)
-
-        required_keys = ['REAL_DEBRID_API_KEY', 'MOUNTED_PATH', 'ZURGINFOS_DIR', 'DB_FILE']
-        for key in required_keys:
-            if key not in settings:
-                raise KeyError(f"Missing required setting: {key}")
-
+        # Simulating some logic that could raise an error
+        print("Attempting to load settings...")
+        # Uncomment the next line to simulate an error
+        # raise FileNotFoundError("Simulating FileNotFoundError for testing.")
+        with open('settings.json', 'r') as f:
+            settings = json.load(f)
         return settings
 
-    except FileNotFoundError:
-        log("Error: settings.json not found", is_error=True)
-        raise
-    except KeyError as e:
-        log(f"Error: {str(e)}", is_error=True)
-        raise
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        # Return default settings or an empty dictionary
+        return {}
+
     except json.JSONDecodeError as e:
-        log(f"Error decoding JSON from settings.json: {str(e)}", is_error=True)
-        raise
+        print(f"Error decoding JSON: {e}")
+        return {}
+
+    except Exception as e:
+        print(f"Some other error occurred: {e}")
+        return {}
+
+    finally:
+        print("This will always run, even if an error occurred.")
 
 # Initialize the SQLite database and create a table for torrents
 def initialize_database(db_file):
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
-    
+
     # Create table if not exists
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS torrents (
@@ -67,14 +73,22 @@ def initialize_database(db_file):
 # Insert or update torrent data into the database
 def insert_or_update_torrent(conn, torrent):
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO torrents (hash, torname, status)
-        VALUES (?, ?, ?)
-        ON CONFLICT(hash) DO UPDATE SET
-            torname=excluded.torname,
-            status=excluded.status
-    ''', (torrent['hash'], torrent['torname'], torrent['status']))
-    conn.commit()
+    cursor.execute('SELECT 1 FROM torrents WHERE hash = ?', (torrent['hash'],))
+    exists = cursor.fetchone()
+    if not exists:
+        cursor.execute('''
+            INSERT INTO torrents (hash, torname, status)
+            VALUES (?, ?, ?)
+        ''', (torrent['hash'], torrent['torname'], torrent['status']))
+        conn.commit()
+        return True  # New torrent added
+    else:
+        cursor.execute('''
+            UPDATE torrents SET torname = ?, status = ?
+            WHERE hash = ?
+        ''', (torrent['torname'], torrent['status'], torrent['hash']))
+        conn.commit()
+        return False  # Torrent already existed
 
 # Update the status of a torrent in the database
 def update_torrent_status(conn, torrent_hash, status):
@@ -96,8 +110,13 @@ def periodic_parse_log(parsed_files):
 
 # Parse .zurginfo and .zurgtorrent files recursively and insert into the database
 def parse_torrent_files_recursively(zurginfo_dir, conn):
-    log(f"Recursively parsing .zurginfo and .zurgtorrent files from directory: {zurginfo_dir}")
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM torrents')
+    before_count = cursor.fetchone()[0]
+    log(f"Number of torrents in the database before parsing: {before_count}")
+
     parsed_files = []
+    new_torrents_count = 0
 
     global parsing_in_progress
     parsing_in_progress = True
@@ -107,45 +126,74 @@ def parse_torrent_files_recursively(zurginfo_dir, conn):
     logger_thread.start()
 
     try:
+        # Start parsing files in the directory
         for root, dirs, files in os.walk(zurginfo_dir):  # Recursively walk through subdirectories
             for file_name in files:
-                if file_name.endswith('.zurginfo') or file_name.endswith('.zurgtorrent'):
-                    file_path = os.path.join(root, file_name)
-                    try:
+                file_path = os.path.join(root, file_name)
+
+                try:
+                    # Parse .zurginfo files
+                    if file_name.endswith('.zurginfo'):
+                        log(f"Detected .zurginfo file: {file_name}")
                         with open(file_path, 'r') as file:
                             data = json.load(file)
-
-                            torrent = {}
-                            if file_name.endswith('.zurginfo'):
-                                torrent = {
-                                    'hash': data.get('hash'),
-                                    'status': 0,
-                                    'torname': data.get('filename')
-                                }
-                            elif file_name.endswith('.zurgtorrent'):
-                                torrent = {
-                                    'hash': data.get('Hash'),
-                                    'status': 0,
-                                    'torname': data.get('Name')
-                                }
-
-                            # Insert or update the torrent in the database
-                            insert_or_update_torrent(conn, torrent)
-
-                            # Log the current file being parsed
-                            log(f"Parsed and added to DB: {file_name}")
-
-                            # Add the file name to the parsed_files list
+                            torrent = {
+                                'hash': data.get('hash'),
+                                'status': 0,
+                                'torname': data.get('filename')
+                            }
+                            is_new_torrent = insert_or_update_torrent(conn, torrent)
+                            if is_new_torrent:
+                                new_torrents_count += 1
+                            log(f"Parsed and added .zurginfo file: {file_name}")
                             parsed_files.append(file_name)
 
-                    except json.JSONDecodeError as e:
-                        log(f"Error decoding JSON in file: {file_name}. Error: {str(e)}", is_error=True)
-
+                    # Parse .zurgtorrent files
+                    elif file_name.endswith('.zurgtorrent'):
+                        log(f"Detected .zurgtorrent file: {file_name}")
+                        with open(file_path, 'rb') as file:
+                            try:
+                                data = bencodepy.decode(file.read())
+                                # Compute the infohash
+                                if b'info' in data:
+                                    info = data[b'info']
+                                    infohash = hashlib.sha1(bencodepy.encode(info)).hexdigest().upper()
+                                    # Get the torrent name
+                                    if b'name' in info:
+                                        torname = info[b'name']
+                                        if isinstance(torname, bytes):
+                                            torname = torname.decode('utf-8', 'ignore')
+                                        else:
+                                            torname = str(torname)
+                                        torrent = {
+                                            'hash': infohash,
+                                            'status': 0,
+                                            'torname': torname
+                                        }
+                                        is_new_torrent = insert_or_update_torrent(conn, torrent)
+                                        if is_new_torrent:
+                                            new_torrents_count += 1
+                                        log(f"Parsed and added .zurgtorrent file: {file_name}")
+                                        parsed_files.append(file_name)
+                                    else:
+                                        log(f"Missing 'name' in 'info' dictionary in .zurgtorrent file: {file_name}", is_error=True)
+                                else:
+                                    log(f"Missing 'info' in .zurgtorrent file: {file_name}", is_error=True)
+                            except Exception as e:
+                                log(f"Error decoding .zurgtorrent file: {file_name}. Error: {str(e)}", is_error=True)
+                except Exception as e:
+                    log(f"An error occurred while parsing file '{file_name}': {str(e)}", is_error=True)
+    except Exception as e:
+        log(f"An error occurred while parsing torrents: {str(e)}", is_error=True)
     finally:
         parsing_in_progress = False
         logger_thread.join()  # Ensure the logging thread ends before continuing
 
-    log(f"Finished parsing torrents. Total parsed: {len(parsed_files)}")
+    cursor.execute('SELECT COUNT(*) FROM torrents')
+    after_count = cursor.fetchone()[0]
+    log(f"Finished parsing torrents. Total parsed files: {len(parsed_files)}")
+    log(f"Number of torrents in the database after parsing: {after_count}")
+    log(f"Number of new torrents added: {new_torrents_count}")
 
 # List files with rclone recursively and show progress
 def list_rclone_files(remote_path):
@@ -153,7 +201,6 @@ def list_rclone_files(remote_path):
     file_list = []
 
     try:
-        # Use subprocess to run the rclone command and let it finish naturally
         process = subprocess.Popen(
             ['rclone', 'lsf', remote_path, '--fast-list', '--recursive'],
             stdout=subprocess.PIPE,
@@ -161,11 +208,10 @@ def list_rclone_files(remote_path):
             text=True
         )
 
-        # Read the output line by line and append to the file list
         for line in process.stdout:
             file_list.append(line.strip())
 
-        return_code = process.wait()  # Wait for the process to complete
+        return_code = process.wait()
 
         if return_code != 0:
             error_output = process.stderr.read()
@@ -228,13 +274,11 @@ def process_torrents(api_key, mounted_path, zurginfo_dir, db_file, timeout, matc
         if status == 1:  # Skip already processed torrents
             continue
 
-        # Match in parallel
         if match_in_parallel(file_list, torrent_name, match_threshold):
             log(f"Torrent '{torrent_name}' already exists in mounted path. Skipping.")
             update_torrent_status(conn, torrent_hash, 1)  # Mark as processed
             continue
 
-        # Add to Real-Debrid if no match found
         log(f"No match found for '{torrent_name}'. Adding to Real-Debrid.")
         torrent_id = add_torrent_to_rd(api_key, torrent_hash, torrent_name, timeout)
 
@@ -247,12 +291,14 @@ def process_torrents(api_key, mounted_path, zurginfo_dir, db_file, timeout, matc
         log(f"Waiting for {api_delay} seconds before the next Real-Debrid API call.")
         time.sleep(api_delay)
 
-    # Close the database connection
     conn.close()
 
 if __name__ == '__main__':
     try:
         settings = load_settings()
+
+        if not settings:
+            raise ValueError("Settings could not be loaded.")
 
         api_key = settings.get('REAL_DEBRID_API_KEY')
         mounted_path = settings.get('MOUNTED_PATH')
@@ -265,5 +311,5 @@ if __name__ == '__main__':
 
         process_torrents(api_key, mounted_path, zurginfo_dir, db_file, timeout, match_threshold, api_delay)
 
-    except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
+    except (KeyError, FileNotFoundError, json.JSONDecodeError, AttributeError, ValueError) as e:
         log(f"Critical error occurred: {str(e)}", is_error=True)
