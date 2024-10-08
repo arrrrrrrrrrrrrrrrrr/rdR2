@@ -1,0 +1,9 @@
+{
+  "REAL_DEBRID_API_KEY": "api",
+  "MOUNTED_PATH": "/mnt/webdav/",
+  "ZURGINFOS_DIR": "/",
+  "DB_FILE": "torrents.db",
+  "EXECUTION_CYCLE": 86400,
+  "REAL_DEBRID_TIMEOUT": 30,
+  "REAL_DEBRID_API_DELAY": 10
+}
